@@ -18,6 +18,10 @@ def softmax(x):
     return x
 
 def bbox_iou(box1, box2, x1y1x2y2=True):
+    if torch.is_tensor(box1):
+        box1 = box1.numpy()
+    if torch.is_tensor(box2):
+        box1 = box2.numpy()
     if x1y1x2y2:
         x1_min = min(box1[0], box2[0])
         x2_max = max(box1[2], box2[2])
