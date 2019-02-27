@@ -5,9 +5,11 @@ import math
 import torch
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
-import itertools
+# import itertools
 import struct # get_image_size
 import imghdr # get_image_size
+from numba import jit
+import numba
 
 def sigmoid(x):
     return 1.0/(math.exp(-x)+1.)
@@ -18,10 +20,6 @@ def softmax(x):
     return x
 
 def bbox_iou(box1, box2, x1y1x2y2=True):
-    if torch.is_tensor(box1):
-        box1 = box1.numpy()
-    if torch.is_tensor(box2):
-        box1 = box2.numpy()
     if x1y1x2y2:
         x1_min = min(box1[0], box2[0])
         x2_max = max(box1[2], box2[2])
@@ -80,6 +78,25 @@ def multi_bbox_ious(boxes1, boxes2, x1y1x2y2=True):
     return carea/uarea
 
 def nms(boxes, nms_thresh):
+    # if len(boxes) == 0:
+    #     return boxes
+    #
+    # det_confs = torch.zeros(len(boxes))
+    # for i in range(len(boxes)):
+    #     det_confs[i] = 1-boxes[i][4]
+    #
+    # _,sortIds = torch.sort(det_confs)
+    # out_boxes = []
+    # for i in range(len(boxes)):
+    #     box_i = boxes[sortIds[i]]
+    #     if box_i[4] > 0:
+    #         out_boxes.append(box_i)
+    #         for j in range(i+1, len(boxes)):
+    #             box_j = boxes[sortIds[j]]
+    #             if bbox_iou(box_i, box_j, x1y1x2y2=False) > nms_thresh:
+    #                 #print(box_i, box_j, bbox_iou(box_i, box_j, x1y1x2y2=False))
+    #                 box_j[4] = 0
+    # return out_boxes
     if len(boxes) == 0:
         return boxes
     res =[]
@@ -115,26 +132,25 @@ def convert2cpu(gpu_matrix):
 def convert2cpu_long(gpu_matrix):
     return torch.LongTensor(gpu_matrix.size()).copy_(gpu_matrix)
 
-def get_all_boxes(output, netshape, conf_thresh, num_classes, only_objectness=1, validation=False, use_cuda=True):
+def get_all_boxes(output, conf_thresh, num_classes, only_objectness=1, validation=False, use_cuda=True):
     # total number of inputs (batch size)
     # first element (x) for first tuple (x, anchor_mask, num_anchor)
     tot = output[0]['x'].data.size(0)
     all_boxes = [[] for i in range(tot)]
     for i in range(len(output)):
-        pred = output[i]['x'].data
-
-        # find number of workers (.s.t, number of GPUS) 
-        nw = output[i]['n'].data.size(0)
-        anchors = output[i]['a'].chunk(nw)[0]
-        num_anchors = output[i]['n'].data[0].item()
-
-        b = get_region_boxes(pred, netshape, conf_thresh, num_classes, anchors, num_anchors, \
-                only_objectness=only_objectness, validation=validation, use_cuda=use_cuda)
+    # for i in range(1):
+        pred, anchors, num_anchors = output[i]['x'].data, output[i]['a'], output[i]['n'].item()
+        # b = get_region_boxes(pred, conf_thresh, num_classes, anchors, num_anchors, \
+        #         only_objectness=only_objectness, validation=validation, use_cuda=use_cuda)
+        pred_ = pred.cpu().numpy()
+        anchors_ = anchors.cpu().numpy()
+        b = get_region_boxes_(pred_, conf_thresh, num_classes, anchors_, num_anchors, \
+                         only_objectness=only_objectness, validation=validation, use_cuda=use_cuda)
         for t in range(tot):
             all_boxes[t] += b[t]
     return all_boxes
 
-def get_region_boxes(output, netshape, conf_thresh, num_classes, anchors, num_anchors, only_objectness=1, validation=False, use_cuda=True):
+def get_region_boxes(output, conf_thresh, num_classes, anchors, num_anchors, only_objectness=1, validation=False, use_cuda=True):
     device = torch.device("cuda" if use_cuda else "cpu")
     anchors = anchors.to(device)
     anchor_step = anchors.size(0)//num_anchors
@@ -145,26 +161,25 @@ def get_region_boxes(output, netshape, conf_thresh, num_classes, anchors, num_an
     h = output.size(2)
     w = output.size(3)
     cls_anchor_dim = batch*num_anchors*h*w
-    if netshape[0] != 0:
-        nw, nh = netshape
-    else:
-        nw, nh = w, h
 
     t0 = time.time()
     all_boxes = []
     output = output.view(batch*num_anchors, 5+num_classes, h*w).transpose(0,1).contiguous().view(5+num_classes, cls_anchor_dim)
-
+    # aa = torch.linspace(0, w-1, w).repeat(batch*num_anchors, h, 1)
     grid_x = torch.linspace(0, w-1, w).repeat(batch*num_anchors, h, 1).view(cls_anchor_dim).to(device)
     grid_y = torch.linspace(0, h-1, h).repeat(w,1).t().repeat(batch*num_anchors, 1, 1).view(cls_anchor_dim).to(device)
     ix = torch.LongTensor(range(0,2)).to(device)
-    anchor_w = anchors.view(num_anchors, anchor_step).index_select(1, ix[0]).repeat(batch, h*w).view(cls_anchor_dim)
-    anchor_h = anchors.view(num_anchors, anchor_step).index_select(1, ix[1]).repeat(batch, h*w).view(cls_anchor_dim)
+    anchor_w = anchors.view(num_anchors, anchor_step).index_select(1, ix[0]).repeat(1, batch, h*w).view(cls_anchor_dim)
+    anchor_h = anchors.view(num_anchors, anchor_step).index_select(1, ix[1]).repeat(1, batch, h*w).view(cls_anchor_dim)
 
-    xs, ys = output[0].sigmoid() + grid_x, output[1].sigmoid() + grid_y
-    ws, hs = output[2].exp() * anchor_w.detach(), output[3].exp() * anchor_h.detach()
-    det_confs = output[4].sigmoid()
+    xs, ys = torch.sigmoid(output[0]) + grid_x, torch.sigmoid(output[1]) + grid_y
+    ws, hs = torch.exp(output[2]) * anchor_w.detach(), torch.exp(output[3]) * anchor_h.detach()
+    det_confs = torch.sigmoid(output[4])
 
     # by ysyun, dim=1 means input is 2D or even dimension else dim=0
+    # aa = output[5:5+num_classes].transpose(0,1)
+    # bb = torch.nn.Softmax(dim=0)(aa)
+    # output 85*507
     cls_confs = torch.nn.Softmax(dim=1)(output[5:5+num_classes].transpose(0,1)).detach()
     cls_max_confs, cls_max_ids = torch.max(cls_confs, 1)
     cls_max_confs = cls_max_confs.view(-1)
@@ -189,7 +204,10 @@ def get_region_boxes(output, netshape, conf_thresh, num_classes, anchors, num_an
                 for i in range(num_anchors):
                     ind = b*sz_hwa + i*sz_hw + cy*w + cx
                     det_conf =  det_confs[ind]
-                    conf = det_conf * (cls_max_confs[ind] if not only_objectness else 1.0)
+                    if only_objectness:
+                        conf = det_confs[ind]
+                    else:
+                        conf = det_confs[ind] * cls_max_confs[ind]
     
                     if conf > conf_thresh:
                         bcx = xs[ind]
@@ -198,7 +216,7 @@ def get_region_boxes(output, netshape, conf_thresh, num_classes, anchors, num_an
                         bh = hs[ind]
                         cls_max_conf = cls_max_confs[ind]
                         cls_max_id = cls_max_ids[ind]
-                        box = [bcx/w, bcy/h, bw/nw, bh/nh, det_conf, cls_max_conf, cls_max_id]
+                        box = [bcx/w, bcy/h, bw/w, bh/h, det_conf, cls_max_conf, cls_max_id]
                         if (not only_objectness) and validation:
                             for c in range(num_classes):
                                 tmp_conf = cls_confs[ind][c]
@@ -214,6 +232,134 @@ def get_region_boxes(output, netshape, conf_thresh, num_classes, anchors, num_an
         print('        gpu to cpu : %f' % (t2-t1))
         print('      boxes filter : %f' % (t3-t2))
         print('---------------------------------')
+    return all_boxes
+
+@jit
+def softmax_(x,ax=0):
+    # x 80*507
+    aa = np.sum(np.exp(x),axis=ax)
+    bb = np.exp(x)
+    res = bb/aa
+    return res.T
+
+@jit
+def sigmoid_(x):
+    s=1.0/(1.0+1.0/np.exp(x))
+    return s
+
+
+def prepar_data(output,batch,num_anchors,num_classes,h,w,cls_anchor_dim,anchors,anchor_step):
+
+    output = output.reshape(batch * num_anchors, 5 + num_classes, h * w).transpose(1, 0, 2).reshape(5 + num_classes,cls_anchor_dim)
+    grid_x = np.expand_dims(np.linspace(0, w - 1, w).reshape(1, -1).repeat(h, 0), 0).repeat(batch * num_anchors,0).reshape(cls_anchor_dim)
+    grid_y = np.expand_dims(np.linspace(0, h - 1, h).reshape(1, -1).repeat(w, 0).T, 0).repeat(batch * num_anchors,0).reshape(cls_anchor_dim)
+    ix = range(0, 2)
+    anchor_w = np.expand_dims(anchors.reshape(num_anchors, anchor_step)[:, ix[0]].repeat(h * w, 0), 0).repeat(
+        batch).reshape(cls_anchor_dim)
+    anchor_h = np.expand_dims(anchors.reshape(num_anchors, anchor_step)[:, ix[1]].repeat(h * w, 0), 0).repeat(
+        batch).reshape(cls_anchor_dim)
+
+    xs, ys = sigmoid_(output[0]) + grid_x, sigmoid_(output[1]) + grid_y
+    ws, hs = np.exp(output[2]) * anchor_w, np.exp(output[3]) * anchor_h
+    det_confs = sigmoid_(output[4])
+
+    # by ysyun, dim=1 means input is 2D or even dimension else dim=0
+    cls_confs = softmax_(output[5:5 + num_classes], ax=0)
+    cls_max_ids = np.argmax(cls_confs, axis=1)
+    cls_max_confs = np.max(cls_confs, axis=1)
+    return xs,ys,ws,hs,cls_max_ids,cls_max_confs,det_confs
+
+def get_region_boxes_(output, conf_thresh, num_classes, anchors, num_anchors, only_objectness=1, validation=False, use_cuda=True):
+    # device = torch.device("cuda" if use_cuda else "cpu")
+    # anchors = anchors.to(device)
+
+    anchor_step = anchors.shape[0]//num_anchors
+    if output.shape[0] == 3:
+        output = np.expand_dims(output,0)
+    batch = output.shape[0]
+    # assert(output.shape[1] == (5+num_classes)*num_anchors)
+    h = output.shape[2]
+    w = output.shape[3]
+    cls_anchor_dim = batch*num_anchors*h*w
+
+    t0 = time.time()
+    all_boxes = []
+
+    output = output.reshape(batch*num_anchors, 5+num_classes, h*w).transpose(1,0,2).reshape(5+num_classes, cls_anchor_dim)
+    # aa = np.expand_dims(np.linspace(0, w-1, w).reshape(1,-1).repeat(h,0),0).repeat(batch*num_anchors,0).reshape(cls_anchor_dim)
+    # bb = np.repeat(np.repeat(aa,h,axis=0),batch*num_anchors,axis=1)
+
+    grid_x = np.expand_dims(np.linspace(0, w-1, w).reshape(1,-1).repeat(h,0),0).repeat(batch*num_anchors,0).reshape(cls_anchor_dim)
+    grid_y = np.expand_dims(np.linspace(0, h-1, h).reshape(1,-1).repeat(w,0).T,0).repeat(batch*num_anchors,0).reshape(cls_anchor_dim)
+    # grid_x = torch.linspace(0, w - 1, w).repeat(batch * num_anchors, h, 1).view(cls_anchor_dim).to(device)
+    # grid_y = torch.linspace(0, h - 1, h).repeat(w, 1).t().repeat(batch * num_anchors, 1, 1).view(cls_anchor_dim).to(device)
+    ix = range(0,2)
+    anchor_w = np.expand_dims(anchors.reshape(num_anchors, anchor_step)[:, ix[0]].repeat(h * w,0),0).repeat(batch).reshape(cls_anchor_dim)
+    anchor_h = np.expand_dims(anchors.reshape(num_anchors, anchor_step)[:, ix[1]].repeat(h * w,0),0).repeat(batch).reshape(cls_anchor_dim)
+
+    # anchor_w = anchors.reshape(num_anchors, anchor_step).index_select(1, ix[0]).repeat(1, batch, h*w).reshape(cls_anchor_dim)
+    # anchor_h = anchors.reshape(num_anchors, anchor_step).index_select(1, ix[1]).repeat(1, batch, h*w).reshape(cls_anchor_dim)
+
+    xs, ys = sigmoid_(output[0]) + grid_x, sigmoid_(output[1]) + grid_y
+    ws, hs = np.exp(output[2]) * anchor_w, np.exp(output[3]) * anchor_h
+    det_confs = sigmoid_(output[4])
+
+    # by ysyun, dim=1 means input is 2D or even dimension else dim=0
+    cls_confs = softmax_(output[5:5 + num_classes], ax=0)
+    # cls_confs = torch.nn.Softmax(dim=1)(output[5:5 + num_classes].transpose(0, 1)).detach()
+    cls_max_ids = np.argmax(cls_confs,axis=1)
+    cls_max_confs = np.max(cls_confs,axis=1)
+    # cls_max_confs = cls_max_confs.reshape(-1)
+    cls_max_ids = cls_max_ids.reshape(-1)
+    # t1 = time.time()
+    # xs, ys, ws, hs, cls_max_ids, cls_max_confs, det_confs=prepar_data(output, batch, num_anchors, num_classes, h, w, cls_anchor_dim, anchors, anchor_step)
+
+    sz_hw = h*w
+    sz_hwa = sz_hw*num_anchors
+    # det_confs = convert2cpu(det_confs)
+    # cls_max_confs = convert2cpu(cls_max_confs)
+    # cls_max_ids = convert2cpu_long(cls_max_ids)
+    # xs, ys = convert2cpu(xs), convert2cpu(ys)
+    # ws, hs = convert2cpu(ws), convert2cpu(hs)
+    if validation:
+        cls_confs = cls_confs.reshape(-1, num_classes)
+
+    # t2 = time.time()
+    for b in range(batch):
+        boxes = []
+        for cy in range(h):
+            for cx in range(w):
+                for i in range(num_anchors):
+                    ind = b*sz_hwa + i*sz_hw + cy*w + cx
+                    det_conf =  det_confs[ind]
+                    if only_objectness:
+                        conf = det_confs[ind]
+                    else:
+                        conf = det_confs[ind] * cls_max_confs[ind]
+
+                    if conf > conf_thresh:
+                        bcx = xs[ind]
+                        bcy = ys[ind]
+                        bw = ws[ind]
+                        bh = hs[ind]
+                        cls_max_conf = cls_max_confs[ind]
+                        cls_max_id = cls_max_ids[ind]
+                        box = [bcx/w, bcy/h, bw/w, bh/h, det_conf, cls_max_conf, cls_max_id]
+                        if (not only_objectness) and validation:
+                            for c in range(num_classes):
+                                tmp_conf = cls_confs[ind][c]
+                                if c != cls_max_id and det_confs[ind]*tmp_conf > conf_thresh:
+                                    box.append(tmp_conf)
+                                    box.append(c)
+                        boxes.append(box)
+        all_boxes.append(boxes)
+    # t3 = time.time()
+    # if True:
+    #     print('---------------------------------')
+    #     print('matrix computation : %f' % (t1-t0))
+    #     print('        gpu to cpu : %f' % (t2-t1))
+    #     print('      boxes filter : %f' % (t3-t2))
+    #     print('---------------------------------')
     return all_boxes
 
 def plot_boxes_cv2(img, boxes, savename=None, class_names=None, color=None):
@@ -258,26 +404,6 @@ def plot_boxes_cv2(img, boxes, savename=None, class_names=None, color=None):
         cv2.imwrite(savename, img)
     return img
 
-def drawrect(drawcontext, xy, outline=None, width=0):
-    x1, y1, x2, y2 = xy
-    points = (x1, y1), (x2, y1), (x2, y2), (x1, y2), (x1, y1)
-    drawcontext.line(points, fill=outline, width=width)
-
-def drawtext(img, pos, text, bgcolor=(255,255,255), font=None):
-    if font is None:
-        font = ImageFont.load_default().font
-    (tw, th) = font.getsize(text)
-    box_img = Image.new('RGB', (tw+2, th+2), bgcolor)
-    ImageDraw.Draw(box_img).text((0, 0), text, fill=(0,0,0,255), font=font)
-    if img.mode != 'RGB':
-        img = img.convert('RGB')
-    sx, sy = pos[0],pos[1]-th-2
-    if sx<0:
-        sx=0
-    if sy<0:
-        sy=0
-    img.paste(box_img, (sx, sy))
-
 def plot_boxes(img, boxes, savename=None, class_names=None):
     colors = torch.FloatTensor([[1,0,1],[0,0,1],[0,1,1],[0,1,0],[1,1,0],[1,0,0]])
     def get_color(c, x, max_val):
@@ -291,15 +417,13 @@ def plot_boxes(img, boxes, savename=None, class_names=None):
     width = img.width
     height = img.height
     draw = ImageDraw.Draw(img)
-    try:
-        font = ImageFont.truetype("arialbd", 14)
-    except:
-        font=None
     print("%d box(es) is(are) found" % len(boxes))
     for i in range(len(boxes)):
         box = boxes[i]
-        x1,y1,x2,y2 = (box[0] - box[2]/2.0) * width, (box[1] - box[3]/2.0) * height, \
-                (box[0] + box[2]/2.0) * width, (box[1] + box[3]/2.0) * height
+        x1 = (box[0] - box[2]/2.0) * width
+        y1 = (box[1] - box[3]/2.0) * height
+        x2 = (box[0] + box[2]/2.0) * width
+        y2 = (box[1] + box[3]/2.0) * height
 
         rgb = (255, 0, 0)
         if len(box) >= 7 and class_names:
@@ -312,9 +436,8 @@ def plot_boxes(img, boxes, savename=None, class_names=None):
             green = get_color(1, offset, classes)
             blue  = get_color(0, offset, classes)
             rgb = (red, green, blue)
-            text = "{} : {:.3f}".format(class_names[cls_id],cls_conf)
-            drawtext(img, (x1, y1), text, bgcolor=rgb, font=font)
-        drawrect(draw, [x1, y1, x2, y2], outline=rgb, width=2)
+            draw.text((x1, y1), class_names[cls_id], fill=rgb)
+        draw.rectangle([x1, y1, x2, y2], outline=rgb)
     if savename:
         print("save plot results to %s" % savename)
         img.save(savename)
@@ -373,11 +496,7 @@ def do_detect(model, img, conf_thresh, nms_thresh, use_cuda=True):
     t2 = time.time()
 
     out_boxes = model(img)
-    if model.net_name() == 'region': # region_layer
-        shape=(0,0)
-    else:
-        shape=(model.width, model.height)
-    boxes = get_all_boxes(out_boxes, shape, conf_thresh, model.num_classes, use_cuda=use_cuda)[0]
+    boxes = get_all_boxes(out_boxes, conf_thresh, model.num_classes, use_cuda=use_cuda)[0]
     
     t3 = time.time()
     boxes = nms(boxes, nms_thresh)
@@ -468,8 +587,3 @@ def get_image_size(fname):
 
 def logging(message):
     print('%s %s' % (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()), message))
-
-def savelog(message):
-    logging(message)
-    with open('savelog.txt', 'a') as f:
-        print('%s %s' % (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()), message), file=f)
